@@ -10,9 +10,11 @@
  *
  * Example:
  *
+ *	struct child_process child = CHILD_PROCESS_INIT;
  *	struct tmp_objdir *t = tmp_objdir_create("incoming");
- *	if (!run_command_v_opt_cd_env(cmd, 0, NULL, tmp_objdir_env(t)) &&
- *	    !tmp_objdir_migrate(t))
+ *	strvec_push(&child.args, cmd);
+ *	strvec_pushv(&child.env, tmp_objdir_env(t));
+ *	if (!run_command(&child)) && !tmp_objdir_migrate(t))
  *		printf("success!\n");
  *	else
  *		die("failed...tmp_objdir will clean up for us");
@@ -47,13 +49,19 @@ int tmp_objdir_migrate(struct tmp_objdir *);
 int tmp_objdir_destroy(struct tmp_objdir *);
 
 /*
+ * Remove all objects from the temporary object directory, while leaving it
+ * around so more objects can be added.
+ */
+void tmp_objdir_discard_objects(struct tmp_objdir *);
+
+/*
  * Add the temporary object directory as an alternate object store in the
  * current process.
  */
 void tmp_objdir_add_as_alternate(const struct tmp_objdir *);
 
 /*
- * Replaces the main object store in the current process with the temporary
+ * Replaces the writable object store in the current process with the temporary
  * object directory and makes the former main object store an alternate.
  * If will_destroy is nonzero, the object directory may not be migrated.
  */
@@ -67,7 +75,7 @@ void tmp_objdir_replace_primary_odb(struct tmp_objdir *, int will_destroy);
 struct tmp_objdir *tmp_objdir_unapply_primary_odb(void);
 
 /*
- * Reapplies the former primary temporary object database, after protentially
+ * Reapplies the former primary temporary object database, after potentially
  * changing its relative path.
  */
 void tmp_objdir_reapply_primary_odb(struct tmp_objdir *, const char *old_cwd,

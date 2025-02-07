@@ -18,7 +18,7 @@
  */
 #define pthread_mutex_t CRITICAL_SECTION
 
-static inline int return_0(int i) {
+static inline int return_0(int i UNUSED) {
 	return 0;
 }
 #define pthread_mutex_init(a,b) return_0((InitializeCriticalSection((a)), 0))
@@ -50,8 +50,9 @@ typedef struct {
 	DWORD tid;
 } pthread_t;
 
-int pthread_create(pthread_t *thread, const void *unused,
-		   void *(*start_routine)(void*), void *arg);
+int win32_pthread_create(pthread_t *thread, const void *unused,
+			 void *(*start_routine)(void*), void *arg);
+#define pthread_create win32_pthread_create
 
 /*
  * To avoid the need of copying a struct, we use small macro wrapper to pass
@@ -62,15 +63,16 @@ int pthread_create(pthread_t *thread, const void *unused,
 int win32_pthread_join(pthread_t *thread, void **value_ptr);
 
 #define pthread_equal(t1, t2) ((t1).tid == (t2).tid)
-pthread_t pthread_self(void);
+pthread_t win32_pthread_self(void);
+#define pthread_self win32_pthread_self
 
 static inline void NORETURN pthread_exit(void *ret)
 {
-	ExitThread((DWORD)(intptr_t)ret);
+	_endthreadex((unsigned)(uintptr_t)ret);
 }
 
 typedef DWORD pthread_key_t;
-static inline int pthread_key_create(pthread_key_t *keyp, void (*destructor)(void *value))
+static inline int pthread_key_create(pthread_key_t *keyp, void (*destructor)(void *value) UNUSED)
 {
 	return (*keyp = TlsAlloc()) == TLS_OUT_OF_INDEXES ? EAGAIN : 0;
 }

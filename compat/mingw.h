@@ -12,9 +12,11 @@ typedef _sigset_t sigset_t;
 #endif
 
 extern int core_fscache;
-extern int core_long_paths;
+int are_long_paths_enabled(void);
 
-int mingw_core_config(const char *var, const char *value, void *cb);
+struct config_context;
+int mingw_core_config(const char *var, const char *value,
+		      const struct config_context *ctx, void *cb);
 #define platform_core_config mingw_core_config
 
 /*
@@ -123,13 +125,13 @@ struct utsname {
  * trivial stubs
  */
 
-static inline int fchmod(int fildes, mode_t mode)
+static inline int fchmod(int fildes UNUSED, mode_t mode UNUSED)
 { errno = ENOSYS; return -1; }
 #ifndef __MINGW64_VERSION_MAJOR
 static inline pid_t fork(void)
 { errno = ENOSYS; return -1; }
 #endif
-static inline unsigned int alarm(unsigned int seconds)
+static inline unsigned int alarm(unsigned int seconds UNUSED)
 { return 0; }
 static inline int fsync(int fd)
 { return _commit(fd); }
@@ -137,9 +139,9 @@ static inline void sync(void)
 {}
 static inline uid_t getuid(void)
 { return 1; }
-static inline struct passwd *getpwnam(const char *name)
+static inline struct passwd *getpwnam(const char *name UNUSED)
 { return NULL; }
-static inline int fcntl(int fd, int cmd, ...)
+static inline int fcntl(int fd UNUSED, int cmd, ...)
 {
 	if (cmd == F_GETFD || cmd == F_SETFD)
 		return 0;
@@ -148,17 +150,17 @@ static inline int fcntl(int fd, int cmd, ...)
 }
 
 #define sigemptyset(x) (void)0
-static inline int sigaddset(sigset_t *set, int signum)
+static inline int sigaddset(sigset_t *set UNUSED, int signum UNUSED)
 { return 0; }
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 0
-static inline int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+static inline int sigprocmask(int how UNUSED, const sigset_t *set UNUSED, sigset_t *oldset UNUSED)
 { return 0; }
 static inline pid_t getppid(void)
 { return 1; }
 static inline pid_t getpgid(pid_t pid)
 { return pid == 0 ? getpid() : pid; }
-static inline pid_t tcgetpgrp(int fd)
+static inline pid_t tcgetpgrp(int fd UNUSED)
 { return getpid(); }
 
 /*
@@ -173,6 +175,9 @@ pid_t waitpid(pid_t pid, int *status, int options);
 
 #define kill mingw_kill
 int mingw_kill(pid_t pid, int sig);
+
+#define locate_in_PATH mingw_locate_in_PATH
+char *mingw_locate_in_PATH(const char *cmd);
 
 #ifndef NO_OPENSSL
 #include <openssl/ssl.h>
@@ -309,6 +314,11 @@ int mingw_socket(int domain, int type, int protocol);
 int mingw_connect(int sockfd, struct sockaddr *sa, size_t sz);
 #define connect mingw_connect
 
+char *mingw_strerror(int errnum);
+#ifndef _UCRT
+#define strerror mingw_strerror
+#endif
+
 int mingw_bind(int sockfd, struct sockaddr *sa, size_t sz);
 #define bind mingw_bind
 
@@ -334,6 +344,9 @@ int mingw_getpagesize(void);
 
 int win32_fsync_no_flush(int fd);
 #define fsync_no_flush win32_fsync_no_flush
+
+#define FSYNC_COMPONENTS_PLATFORM_DEFAULT (FSYNC_COMPONENTS_DEFAULT | FSYNC_COMPONENT_LOOSE_OBJECT)
+#define FSYNC_METHOD_DEFAULT (FSYNC_METHOD_BATCH)
 
 struct rlimit {
 	unsigned int rlim_cur;
@@ -484,6 +497,13 @@ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path);
 #else
 #include <inttypes.h>
 #endif
+
+/**
+ * Verifies that the specified path is owned by the user running the
+ * current process.
+ */
+int is_path_owned_by_current_sid(const char *path, struct strbuf *report);
+#define is_path_owned_by_current_user is_path_owned_by_current_sid
 
 /**
  * Verifies that the given path is a valid one on Windows.
@@ -637,7 +657,7 @@ static inline int xutftowcs_path(wchar_t *wcs, const char *utf)
 static inline int xutftowcs_long_path(wchar_t *wcs, const char *utf)
 {
 	return xutftowcs_path_ex(wcs, utf, MAX_LONG_PATH, -1, MAX_PATH,
-			core_long_paths);
+				 are_long_paths_enabled());
 }
 
 /**
@@ -709,6 +729,12 @@ void open_in_gdb(void);
  * Used by Pthread API implementation for Windows
  */
 int err_win_to_posix(DWORD winerr);
+
+#ifndef NO_UNIX_SOCKETS
+int mingw_have_unix_sockets(void);
+#undef have_unix_sockets
+#define have_unix_sockets mingw_have_unix_sockets
+#endif
 
 /*
  * Check current process is inside Windows Container.

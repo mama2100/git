@@ -4,11 +4,13 @@
  * It just splits a mbox into a list of files: "0001" "0002" ..
  * so you can process them further from there.
  */
-#include "cache.h"
+
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
+#include "gettext.h"
 #include "string-list.h"
 #include "strbuf.h"
-#include "config.h"
 
 static const char git_mailsplit_usage[] =
 "git mailsplit [-d<prec>] [-f<n>] [-b] [--keep-cr] -o<directory> [(<mbox>|<Maildir>)...]";
@@ -114,14 +116,14 @@ static int populate_maildir_list(struct string_list *list, const char *path)
 	DIR *dir;
 	struct dirent *dent;
 	char *name = NULL;
-	char *subs[] = { "cur", "new", NULL };
-	char **sub;
+	const char *subs[] = { "cur", "new", NULL };
+	const char **sub;
 	int ret = -1;
 
 	for (sub = subs; *sub; ++sub) {
 		free(name);
 		name = xstrfmt("%s/%s", path, *sub);
-		if ((dir = opendir(name)) == NULL) {
+		if (!(dir = opendir(name))) {
 			if (errno == ENOENT)
 				continue;
 			error_errno("cannot opendir %s", name);
@@ -173,7 +175,6 @@ static int split_maildir(const char *maildir, const char *dir,
 	char *file = NULL;
 	FILE *f = NULL;
 	int ret = -1;
-	int i;
 	struct string_list list = STRING_LIST_INIT_DUP;
 
 	list.cmp = maildir_filename_cmp;
@@ -181,7 +182,7 @@ static int split_maildir(const char *maildir, const char *dir,
 	if (populate_maildir_list(&list, maildir) < 0)
 		goto out;
 
-	for (i = 0; i < list.nr; i++) {
+	for (size_t i = 0; i < list.nr; i++) {
 		char *name;
 
 		free(file);
@@ -223,6 +224,9 @@ static int split_mbox(const char *file, const char *dir, int allow_bare,
 
 	FILE *f = !strcmp(file, "-") ? stdin : fopen(file, "r");
 	int file_done = 0;
+
+	if (isatty(fileno(f)))
+		warning(_("reading patches from stdin/tty..."));
 
 	if (!f) {
 		error_errno("cannot open mbox %s", file);
@@ -267,7 +271,10 @@ out:
 	return ret;
 }
 
-int cmd_mailsplit(int argc, const char **argv, const char *prefix)
+int cmd_mailsplit(int argc,
+		  const char **argv,
+		  const char *prefix,
+		  struct repository *repo UNUSED)
 {
 	int nr = 0, nr_prec = 4, num = 0;
 	int allow_bare = 0;
@@ -275,7 +282,8 @@ int cmd_mailsplit(int argc, const char **argv, const char *prefix)
 	const char **argp;
 	static const char *stdin_only[] = { "-", NULL };
 
-	git_config(git_default_config, NULL);
+	BUG_ON_NON_EMPTY_PREFIX(prefix);
+
 	for (argp = argv+1; *argp; argp++) {
 		const char *arg = *argp;
 

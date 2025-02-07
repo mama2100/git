@@ -35,7 +35,19 @@ static inline uint64_t default_bswap64(uint64_t val)
 #undef bswap32
 #undef bswap64
 
-#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
+/**
+ * __has_builtin is available since Clang 10 and GCC 10.
+ * Below is a fallback for older compilers.
+ */
+#ifndef __has_builtin
+	#define __has_builtin(x) 0
+#endif
+
+#if __has_builtin(__builtin_bswap32) && __has_builtin(__builtin_bswap64)
+#define bswap32(x) __builtin_bswap32((x))
+#define bswap64(x) __builtin_bswap64((x))
+
+#elif defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
 
 #define bswap32 git_bswap32
 static inline uint32_t git_bswap32(uint32_t x)
@@ -171,23 +183,23 @@ static inline uint64_t get_be64(const void *ptr)
 static inline void put_be32(void *ptr, uint32_t value)
 {
 	unsigned char *p = ptr;
-	p[0] = value >> 24;
-	p[1] = value >> 16;
-	p[2] = value >>  8;
-	p[3] = value >>  0;
+	p[0] = (value >> 24) & 0xff;
+	p[1] = (value >> 16) & 0xff;
+	p[2] = (value >>  8) & 0xff;
+	p[3] = (value >>  0) & 0xff;
 }
 
 static inline void put_be64(void *ptr, uint64_t value)
 {
 	unsigned char *p = ptr;
-	p[0] = value >> 56;
-	p[1] = value >> 48;
-	p[2] = value >> 40;
-	p[3] = value >> 32;
-	p[4] = value >> 24;
-	p[5] = value >> 16;
-	p[6] = value >>  8;
-	p[7] = value >>  0;
+	p[0] = (value >> 56) & 0xff;
+	p[1] = (value >> 48) & 0xff;
+	p[2] = (value >> 40) & 0xff;
+	p[3] = (value >> 32) & 0xff;
+	p[4] = (value >> 24) & 0xff;
+	p[5] = (value >> 16) & 0xff;
+	p[6] = (value >>  8) & 0xff;
+	p[7] = (value >>  0) & 0xff;
 }
 
 #endif /* COMPAT_BSWAP_H */

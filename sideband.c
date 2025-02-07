@@ -1,9 +1,15 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
 #include "color.h"
 #include "config.h"
+#include "editor.h"
+#include "gettext.h"
 #include "sideband.h"
 #include "help.h"
 #include "pkt-line.h"
+#include "write-or-die.h"
 
 struct keyword_entry {
 	/*
@@ -20,6 +26,12 @@ static struct keyword_entry keywords[] = {
 	{ "error",	GIT_COLOR_BOLD_RED },
 };
 
+static enum {
+	ALLOW_NO_CONTROL_CHARACTERS = 0,
+	ALLOW_ALL_CONTROL_CHARACTERS = 1,
+	ALLOW_ANSI_COLOR_SEQUENCES = 2
+} allow_control_characters = ALLOW_ANSI_COLOR_SEQUENCES;
+
 /* Returns a color setting (GIT_COLOR_NEVER, etc). */
 static int use_sideband_colors(void)
 {
@@ -27,28 +39,46 @@ static int use_sideband_colors(void)
 
 	const char *key = "color.remote";
 	struct strbuf sb = STRBUF_INIT;
-	char *value;
+	const char *value;
 	int i;
 
 	if (use_sideband_colors_cached >= 0)
 		return use_sideband_colors_cached;
 
-	if (!git_config_get_string(key, &value)) {
-		use_sideband_colors_cached = git_config_colorbool(key, value);
-	} else if (!git_config_get_string("color.ui", &value)) {
-		use_sideband_colors_cached = git_config_colorbool("color.ui", value);
-	} else {
-		use_sideband_colors_cached = GIT_COLOR_AUTO;
+	switch (git_config_get_maybe_bool("sideband.allowcontrolcharacters", &i)) {
+	case 0: /* Boolean value */
+		allow_control_characters = i ? ALLOW_ALL_CONTROL_CHARACTERS :
+			ALLOW_NO_CONTROL_CHARACTERS;
+		break;
+	case -1: /* non-Boolean value */
+		if (git_config_get_string_tmp("sideband.allowcontrolcharacters",
+					      &value))
+			; /* huh? `get_maybe_bool()` returned -1 */
+		else if (!strcmp(value, "color"))
+			allow_control_characters = ALLOW_ANSI_COLOR_SEQUENCES;
+		else
+			warning(_("unrecognized value for `sideband."
+				  "allowControlCharacters`: '%s'"), value);
+		break;
+	default:
+		break; /* not configured */
 	}
+
+	if (!git_config_get_string_tmp(key, &value))
+		use_sideband_colors_cached = git_config_colorbool(key, value);
+	else if (!git_config_get_string_tmp("color.ui", &value))
+		use_sideband_colors_cached = git_config_colorbool("color.ui", value);
+	else
+		use_sideband_colors_cached = GIT_COLOR_AUTO;
 
 	for (i = 0; i < ARRAY_SIZE(keywords); i++) {
 		strbuf_reset(&sb);
 		strbuf_addf(&sb, "%s.%s", key, keywords[i].keyword);
-		if (git_config_get_string(sb.buf, &value))
+		if (git_config_get_string_tmp(sb.buf, &value))
 			continue;
-		if (color_parse(value, keywords[i].color))
-			continue;
+		color_parse(value, keywords[i].color);
 	}
+
 	strbuf_release(&sb);
 	return use_sideband_colors_cached;
 }
@@ -61,19 +91,71 @@ void list_config_color_sideband_slots(struct string_list *list, const char *pref
 		list_config_item(list, prefix, keywords[i].keyword);
 }
 
+static int handle_ansi_color_sequence(struct strbuf *dest, const char *src, int n)
+{
+	int i;
+
+	/*
+	 * Valid ANSI color sequences are of the form
+	 *
+	 * ESC [ [<n> [; <n>]*] m
+	 */
+
+	if (allow_control_characters != ALLOW_ANSI_COLOR_SEQUENCES ||
+	    n < 3 || src[0] != '\x1b' || src[1] != '[')
+		return 0;
+
+	for (i = 2; i < n; i++) {
+		if (src[i] == 'm') {
+			strbuf_add(dest, src, i + 1);
+			return i;
+		}
+		if (!isdigit(src[i]) && src[i] != ';')
+			break;
+	}
+
+	return 0;
+}
+
+static void strbuf_add_sanitized(struct strbuf *dest, const char *src, int n)
+{
+	int i;
+
+	if (allow_control_characters == ALLOW_ALL_CONTROL_CHARACTERS) {
+		strbuf_add(dest, src, n);
+		return;
+	}
+
+	strbuf_grow(dest, n);
+	for (; n && *src; src++, n--) {
+		if (!iscntrl(*src) || *src == '\t' || *src == '\n')
+			strbuf_addch(dest, *src);
+		else if ((i = handle_ansi_color_sequence(dest, src, n))) {
+			src += i;
+			n -= i;
+		} else {
+			strbuf_addch(dest, '^');
+			strbuf_addch(dest, 0x40 + *src);
+		}
+	}
+}
+
 /*
  * Optionally highlight one keyword in remote output if it appears at the start
  * of the line. This should be called for a single line only, which is
  * passed as the first N characters of the SRC array.
  *
- * NEEDSWORK: use "size_t n" instead for clarity.
+ * It is fine to use "int n" here instead of "size_t n" as all calls to this
+ * function pass an 'int' parameter. Additionally, the buffer involved in
+ * storing these 'int' values takes input from a packet via the pkt-line
+ * interface, which is capable of transferring only 64kB at a time.
  */
 static void maybe_colorize_sideband(struct strbuf *dest, const char *src, int n)
 {
 	int i;
 
 	if (!want_color_stderr(use_sideband_colors())) {
-		strbuf_add(dest, src, n);
+		strbuf_add_sanitized(dest, src, n);
 		return;
 	}
 
@@ -106,7 +188,7 @@ static void maybe_colorize_sideband(struct strbuf *dest, const char *src, int n)
 		}
 	}
 
-	strbuf_add(dest, src, n);
+	strbuf_add_sanitized(dest, src, n);
 }
 
 
@@ -184,7 +266,7 @@ int demultiplex_sideband(const char *me, int status,
 			int linelen = brk - b;
 
 			/*
-			 * For message accross packet boundary, there would have
+			 * For message across packet boundary, there would have
 			 * a nonempty "scratch" buffer from last call of this
 			 * function, and there may have a leading CR/LF in "buf".
 			 * For this case we should add a clear-to-eol suffix to
@@ -214,7 +296,7 @@ int demultiplex_sideband(const char *me, int status,
 			}
 
 			strbuf_addch(scratch, *brk);
-			xwrite(2, scratch->buf, scratch->len);
+			write_in_full(2, scratch->buf, scratch->len);
 			strbuf_reset(scratch);
 
 			b = brk + 1;
@@ -241,7 +323,7 @@ cleanup:
 		die("%s", scratch->buf);
 	if (scratch->len) {
 		strbuf_addch(scratch, '\n');
-		xwrite(2, scratch->buf, scratch->len);
+		write_in_full(2, scratch->buf, scratch->len);
 	}
 	strbuf_release(scratch);
 	return 1;

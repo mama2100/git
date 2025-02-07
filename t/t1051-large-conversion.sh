@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='test conversion filters on large files'
+
 . ./test-lib.sh
 
 set_attr() {
@@ -88,13 +89,14 @@ test_expect_success 'ident converts on output' '
 test_expect_success EXPENSIVE,SIZE_T_IS_64BIT,!LONG_IS_64BIT \
 		'files over 4GB convert on output' '
 	test_commit test small "a small file" &&
+	small_size=$(test_file_size small) &&
 	test_config filter.makelarge.smudge \
 		"test-tool genzeros $((5*1024*1024*1024)) && cat" &&
 	echo "small filter=makelarge" >.gitattributes &&
 	rm small &&
 	git checkout -- small &&
 	size=$(test_file_size small) &&
-	test "$size" -ge $((5 * 1024 * 1024 * 1024))
+	test "$size" -eq $((5 * 1024 * 1024 * 1024 + $small_size))
 '
 
 # This clean filter writes down the size of input it receives. By checking against

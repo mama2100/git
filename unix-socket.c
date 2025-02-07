@@ -1,4 +1,7 @@
-#include "cache.h"
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "strbuf.h"
 #include "unix-socket.h"
 
 #define DEFAULT_UNIX_STREAM_LISTEN_BACKLOG (5)
@@ -79,7 +82,7 @@ int unix_stream_connect(const char *path, int disallow_chdir)
 	struct unix_sockaddr_context ctx;
 
 	if (unix_sockaddr_init(&sa, path, &ctx, disallow_chdir) < 0)
-		return -1;
+		goto fail;
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		goto fail;

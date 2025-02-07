@@ -1,20 +1,30 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
+#include "abspath.h"
 #include "config.h"
+#include "dir.h"
+#include "gettext.h"
 #include "parse-options.h"
-#include "fsmonitor.h"
+#include "fsmonitor-ll.h"
 #include "fsmonitor-ipc.h"
+#include "fsmonitor-settings.h"
 #include "compat/fsmonitor/fsm-health.h"
 #include "compat/fsmonitor/fsm-listen.h"
 #include "fsmonitor--daemon.h"
+
 #include "simple-ipc.h"
 #include "khash.h"
-#include "pkt-line.h"
+#include "run-command.h"
+#include "trace.h"
+#include "trace2.h"
 
 static const char * const builtin_fsmonitor__daemon_usage[] = {
 	N_("git fsmonitor--daemon start [<options>]"),
 	N_("git fsmonitor--daemon run [<options>]"),
-	N_("git fsmonitor--daemon stop"),
-	N_("git fsmonitor--daemon status"),
+	"git fsmonitor--daemon stop",
+	"git fsmonitor--daemon status",
 	NULL
 };
 
@@ -31,10 +41,11 @@ static int fsmonitor__start_timeout_sec = 60;
 #define FSMONITOR__ANNOUNCE_STARTUP "fsmonitor.announcestartup"
 static int fsmonitor__announce_startup = 0;
 
-static int fsmonitor_config(const char *var, const char *value, void *cb)
+static int fsmonitor_config(const char *var, const char *value,
+			    const struct config_context *ctx, void *cb)
 {
 	if (!strcmp(var, FSMONITOR__IPC_THREADS)) {
-		int i = git_config_int(var, value);
+		int i = git_config_int(var, value, ctx->kvi);
 		if (i < 1)
 			return error(_("value of '%s' out of range: %d"),
 				     FSMONITOR__IPC_THREADS, i);
@@ -43,7 +54,7 @@ static int fsmonitor_config(const char *var, const char *value, void *cb)
 	}
 
 	if (!strcmp(var, FSMONITOR__START_TIMEOUT)) {
-		int i = git_config_int(var, value);
+		int i = git_config_int(var, value, ctx->kvi);
 		if (i < 0)
 			return error(_("value of '%s' out of range: %d"),
 				     FSMONITOR__START_TIMEOUT, i);
@@ -53,7 +64,7 @@ static int fsmonitor_config(const char *var, const char *value, void *cb)
 
 	if (!strcmp(var, FSMONITOR__ANNOUNCE_STARTUP)) {
 		int is_bool;
-		int i = git_config_bool_or_int(var, value, &is_bool);
+		int i = git_config_bool_or_int(var, value, ctx->kvi, &is_bool);
 		if (i < 0)
 			return error(_("value of '%s' not bool or int: %d"),
 				     var, i);
@@ -61,7 +72,7 @@ static int fsmonitor_config(const char *var, const char *value, void *cb)
 		return 0;
 	}
 
-	return git_default_config(var, value, cb);
+	return git_default_config(var, value, ctx, cb);
 }
 
 /*
@@ -110,19 +121,20 @@ static int do_as_client__status(void)
 
 enum fsmonitor_cookie_item_result {
 	FCIR_ERROR = -1, /* could not create cookie file ? */
-	FCIR_INIT = 0,
+	FCIR_INIT,
 	FCIR_SEEN,
 	FCIR_ABORT,
 };
 
 struct fsmonitor_cookie_item {
 	struct hashmap_entry entry;
-	const char *name;
+	char *name;
 	enum fsmonitor_cookie_item_result result;
 };
 
-static int cookies_cmp(const void *data, const struct hashmap_entry *he1,
-		     const struct hashmap_entry *he2, const void *keydata)
+static int cookies_cmp(const void *data UNUSED,
+		       const struct hashmap_entry *he1,
+		       const struct hashmap_entry *he2, const void *keydata)
 {
 	const struct fsmonitor_cookie_item *a =
 		container_of(he1, const struct fsmonitor_cookie_item, entry);
@@ -167,31 +179,44 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	 * that the listener thread has seen it.
 	 */
 	fd = open(cookie_pathname.buf, O_WRONLY | O_CREAT | O_EXCL, 0600);
-	if (fd >= 0) {
-		close(fd);
-		unlink(cookie_pathname.buf);
-
-		/*
-		 * NEEDSWORK: This is an infinite wait (well, unless another
-		 * thread sends us an abort).  I'd like to change this to
-		 * use `pthread_cond_timedwait()` and return an error/timeout
-		 * and let the caller do the trivial response thing.
-		 */
-		while (cookie->result == FCIR_INIT)
-			pthread_cond_wait(&state->cookies_cond,
-					  &state->main_lock);
-	} else {
+	if (fd < 0) {
 		error_errno(_("could not create fsmonitor cookie '%s'"),
 			    cookie->name);
 
 		cookie->result = FCIR_ERROR;
+		goto done;
 	}
 
+	/*
+	 * Technically, close() and unlink() can fail, but we don't
+	 * care here.  We only created the file to trigger a watch
+	 * event from the FS to know that when we're up to date.
+	 */
+	close(fd);
+	unlink(cookie_pathname.buf);
+
+	/*
+	 * Technically, this is an infinite wait (well, unless another
+	 * thread sends us an abort).  I'd like to change this to
+	 * use `pthread_cond_timedwait()` and return an error/timeout
+	 * and let the caller do the trivial response thing, but we
+	 * don't have that routine in our thread-utils.
+	 *
+	 * After extensive beta testing I'm not really worried about
+	 * this.  Also note that the above open() and unlink() calls
+	 * will cause at least two FS events on that path, so the odds
+	 * of getting stuck are pretty slim.
+	 */
+	while (cookie->result == FCIR_INIT)
+		pthread_cond_wait(&state->cookies_cond,
+				  &state->main_lock);
+
+done:
 	hashmap_remove(&state->cookies, &cookie->entry, NULL);
 
 	result = cookie->result;
 
-	free((char*)cookie->name);
+	free(cookie->name);
 	free(cookie);
 	strbuf_release(&cookie_pathname);
 
@@ -551,7 +576,7 @@ static void fsmonitor_free_token_data(struct fsmonitor_token_data *token)
  * [2] Some of those lost events may have been for cookie files.  We
  *     should assume the worst and abort them rather letting them starve.
  *
- * If there are no concurrent threads readering the current token data
+ * If there are no concurrent threads reading the current token data
  * series, we can free it now.  Otherwise, let the last reader free
  * it.
  *
@@ -696,6 +721,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 				  "fsmonitor: unsupported V1 protocol '%s'"),
 				 command);
 		do_trivial = 1;
+		do_cookie = 1;
 
 	} else {
 		/* We have "builtin:*" */
@@ -705,6 +731,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 					 "fsmonitor: invalid V2 protocol token '%s'",
 					 command);
 			do_trivial = 1;
+			do_cookie = 1;
 
 		} else {
 			/*
@@ -809,9 +836,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 		trace2_data_intmax("fsmonitor", the_repository,
 				   "response/trivial", 1);
 
-		strbuf_release(&response_token);
-		strbuf_release(&requested_token_id);
-		return 0;
+		goto cleanup;
 	}
 
 	/*
@@ -927,6 +952,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	trace2_data_intmax("fsmonitor", the_repository, "response/count/files", count);
 	trace2_data_intmax("fsmonitor", the_repository, "response/count/duplicates", duplicates);
 
+cleanup:
 	strbuf_release(&response_token);
 	strbuf_release(&requested_token_id);
 	strbuf_release(&payload);
@@ -1184,9 +1210,9 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 * system event listener thread so that we have the IPC handle
 	 * before we need it.
 	 */
-	if (ipc_server_run_async(&state->ipc_server_data,
-				 state->path_ipc.buf, &ipc_opts,
-				 handle_client, state))
+	if (ipc_server_init_async(&state->ipc_server_data,
+				  state->path_ipc.buf, &ipc_opts,
+				  handle_client, state))
 		return error_errno(
 			_("could not start IPC thread pool on '%s'"),
 			state->path_ipc.buf);
@@ -1196,7 +1222,7 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 * events.
 	 */
 	if (pthread_create(&state->listener_thread, NULL,
-			   fsm_listen__thread_proc, state) < 0) {
+			   fsm_listen__thread_proc, state)) {
 		ipc_server_stop_async(state->ipc_server_data);
 		err = error(_("could not start fsmonitor listener thread"));
 		goto cleanup;
@@ -1207,7 +1233,7 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 * Start the health thread to watch over our process.
 	 */
 	if (pthread_create(&state->health_thread, NULL,
-			   fsm_health__thread_proc, state) < 0) {
+			   fsm_health__thread_proc, state)) {
 		ipc_server_stop_async(state->ipc_server_data);
 		err = error(_("could not start fsmonitor health thread"));
 		goto cleanup;
@@ -1267,8 +1293,14 @@ static int fsmonitor_run_daemon(void)
 
 	/* Prepare to (recursively) watch the <worktree-root> directory. */
 	strbuf_init(&state.path_worktree_watch, 0);
-	strbuf_addstr(&state.path_worktree_watch, absolute_path(get_git_work_tree()));
+	strbuf_addstr(&state.path_worktree_watch,
+		      absolute_path(repo_get_work_tree(the_repository)));
 	state.nr_paths_watching = 1;
+
+	strbuf_init(&state.alias.alias, 0);
+	strbuf_init(&state.alias.points_to, 0);
+	if ((err = fsmonitor__get_alias(state.path_worktree_watch.buf, &state.alias)))
+		goto done;
 
 	/*
 	 * We create and delete cookie files somewhere inside the .git
@@ -1282,7 +1314,9 @@ static int fsmonitor_run_daemon(void)
 	strbuf_addstr(&state.path_gitdir_watch, "/.git");
 	if (!is_directory(state.path_gitdir_watch.buf)) {
 		strbuf_reset(&state.path_gitdir_watch);
-		strbuf_addstr(&state.path_gitdir_watch, absolute_path(get_git_dir()));
+		strbuf_addstr(&state.path_gitdir_watch,
+			      absolute_path(repo_get_git_dir(the_repository)));
+		strbuf_strip_suffix(&state.path_gitdir_watch, "/.");
 		state.nr_paths_watching = 2;
 	}
 
@@ -1331,7 +1365,8 @@ static int fsmonitor_run_daemon(void)
 	 * directory.)
 	 */
 	strbuf_init(&state.path_ipc, 0);
-	strbuf_addstr(&state.path_ipc, absolute_path(fsmonitor_ipc__get_path()));
+	strbuf_addstr(&state.path_ipc,
+		absolute_path(fsmonitor_ipc__get_path(the_repository)));
 
 	/*
 	 * Confirm that we can create platform-specific resources for the
@@ -1362,7 +1397,7 @@ static int fsmonitor_run_daemon(void)
 	 */
 	home = getenv("HOME");
 	if (home && *home && chdir(home))
-		die_errno("could not cd home '%s'", home);
+		die_errno(_("could not cd home '%s'"), home);
 
 	err = fsmonitor_run_daemon_1(&state);
 
@@ -1378,15 +1413,13 @@ done:
 	strbuf_release(&state.path_gitdir_watch);
 	strbuf_release(&state.path_cookie_prefix);
 	strbuf_release(&state.path_ipc);
-
-	/*
-	 * NEEDSWORK: Consider "rm -rf <gitdir>/<fsmonitor-dir>"
-	 */
+	strbuf_release(&state.alias.alias);
+	strbuf_release(&state.alias.points_to);
 
 	return err;
 }
 
-static int try_to_run_foreground_daemon(int free_console)
+static int try_to_run_foreground_daemon(int detach_console MAYBE_UNUSED)
 {
 	/*
 	 * Technically, we don't need to probe for an existing daemon
@@ -1397,7 +1430,7 @@ static int try_to_run_foreground_daemon(int free_console)
 	 * common error case.
 	 */
 	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
-		die("fsmonitor--daemon is already running '%s'",
+		die(_("fsmonitor--daemon is already running '%s'"),
 		    the_repository->worktree);
 
 	if (fsmonitor__announce_startup) {
@@ -1407,7 +1440,7 @@ static int try_to_run_foreground_daemon(int free_console)
 	}
 
 #ifdef GIT_WINDOWS_NATIVE
-	if (free_console)
+	if (detach_console)
 		FreeConsole();
 #endif
 
@@ -1416,7 +1449,8 @@ static int try_to_run_foreground_daemon(int free_console)
 
 static start_bg_wait_cb bg_wait_cb;
 
-static int bg_wait_cb(const struct child_process *cp, void *cb_data)
+static int bg_wait_cb(const struct child_process *cp UNUSED,
+		      void *cb_data UNUSED)
 {
 	enum ipc_active_state s = fsmonitor_ipc__get_state();
 
@@ -1452,7 +1486,7 @@ static int try_to_start_background_daemon(void)
 	 * immediately exited).
 	 */
 	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
-		die("fsmonitor--daemon is already running '%s'",
+		die(_("fsmonitor--daemon is already running '%s'"),
 		    the_repository->worktree);
 
 	if (fsmonitor__announce_startup) {
@@ -1465,7 +1499,7 @@ static int try_to_start_background_daemon(void)
 
 	strvec_push(&cp.args, "fsmonitor--daemon");
 	strvec_push(&cp.args, "run");
-	strvec_push(&cp.args, "--free-console");
+	strvec_push(&cp.args, "--detach");
 	strvec_pushf(&cp.args, "--ipc-threads=%d", fsmonitor__ipc_threads);
 
 	cp.no_stdin = 1;
@@ -1482,29 +1516,33 @@ static int try_to_start_background_daemon(void)
 	default:
 	case SBGR_ERROR:
 	case SBGR_CB_ERROR:
-		return error("daemon failed to start");
+		return error(_("daemon failed to start"));
 
 	case SBGR_TIMEOUT:
-		return error("daemon not online yet");
+		return error(_("daemon not online yet"));
 
 	case SBGR_DIED:
-		return error("daemon terminated");
+		return error(_("daemon terminated"));
 	}
 }
 
-int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
+int cmd_fsmonitor__daemon(int argc,
+			  const char **argv,
+			  const char *prefix,
+			  struct repository *repo UNUSED)
 {
 	const char *subcmd;
-	int free_console = 0;
+	enum fsmonitor_reason reason;
+	int detach_console = 0;
 
 	struct option options[] = {
-		OPT_BOOL(0, "free-console", &free_console, N_("free console")),
+		OPT_BOOL(0, "detach", &detach_console, N_("detach from console")),
 		OPT_INTEGER(0, "ipc-threads",
 			    &fsmonitor__ipc_threads,
 			    N_("use <n> ipc worker threads")),
 		OPT_INTEGER(0, "start-timeout",
 			    &fsmonitor__start_timeout_sec,
-			    N_("Max seconds to wait for background daemon startup")),
+			    N_("max seconds to wait for background daemon startup")),
 
 		OPT_END()
 	};
@@ -1522,21 +1560,27 @@ int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
 		    fsmonitor__ipc_threads);
 
 	prepare_repo_settings(the_repository);
+	/*
+	 * If the repo is fsmonitor-compatible, explicitly set IPC-mode
+	 * (without bothering to load the `core.fsmonitor` config settings).
+	 *
+	 * If the repo is not compatible, the repo-settings will be set to
+	 * incompatible rather than IPC, so we can use one of the __get
+	 * routines to detect the discrepancy.
+	 */
 	fsm_settings__set_ipc(the_repository);
 
-	if (fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_INCOMPATIBLE) {
-		struct strbuf buf_reason = STRBUF_INIT;
-		fsm_settings__get_reason(the_repository, &buf_reason);
-		error("%s '%s'", buf_reason.buf, xgetcwd());
-		strbuf_release(&buf_reason);
-		return -1;
-	}
+	reason = fsm_settings__get_reason(the_repository);
+	if (reason > FSMONITOR_REASON_OK)
+		die("%s",
+		    fsm_settings__get_incompatible_msg(the_repository,
+						       reason));
 
 	if (!strcmp(subcmd, "start"))
 		return !!try_to_start_background_daemon();
 
 	if (!strcmp(subcmd, "run"))
-		return !!try_to_run_foreground_daemon(free_console);
+		return !!try_to_run_foreground_daemon(detach_console);
 
 	if (!strcmp(subcmd, "stop"))
 		return !!do_as_client__send_stop();
@@ -1548,7 +1592,7 @@ int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
 }
 
 #else
-int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
+int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix UNUSED, struct repository *repo UNUSED)
 {
 	struct option options[] = {
 		OPT_END()
